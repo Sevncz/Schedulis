@@ -60,11 +60,7 @@ import azkaban.project.ProjectManagerException;
 import azkaban.sla.SlaOption;
 import azkaban.spi.AzkabanEventReporter;
 import azkaban.spi.EventType;
-import azkaban.utils.FileIOUtils;
-import azkaban.utils.Props;
-import azkaban.utils.SwapQueue;
-import azkaban.utils.Utils;
-import com.alibaba.fastjson.JSONObject;
+import azkaban.utils.*;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -72,6 +68,7 @@ import com.google.common.io.Files;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.webank.wedatasphere.schedulis.common.executor.ExecutionCycle;
 import com.webank.wedatasphere.schedulis.common.jobExecutor.utils.SystemBuiltInParamJodeTimeUtils;
+import com.webank.wedatasphere.schedulis.common.utils.LogUtils;
 import com.webank.wedatasphere.schedulis.exec.execapp.KillFlowTrigger;
 import java.io.File;
 import java.io.IOException;
@@ -79,16 +76,7 @@ import java.security.AccessControlContext;
 import java.security.AccessController;
 import java.security.PrivilegedExceptionAction;
 import java.security.ProtectionDomain;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -103,13 +91,10 @@ import java.util.stream.Collectors;
 import javax.script.ScriptEngine;
 import javax.script.ScriptEngineManager;
 import javax.script.ScriptException;
+import com.google.gson.JsonObject;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.StringUtils;
-import org.apache.log4j.Appender;
-import org.apache.log4j.FileAppender;
-import org.apache.log4j.Layout;
-import org.apache.log4j.Logger;
-import org.apache.log4j.PatternLayout;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -117,8 +102,6 @@ import org.apache.log4j.PatternLayout;
  */
 public class FlowRunner extends EventHandler implements Runnable {
 
-  private static final Layout DEFAULT_LAYOUT = new PatternLayout(
-          "%d{dd-MM-yyyy HH:mm:ss z} %c{1} %p - %m\n");
   // We check update every 5 minutes, just in case things get stuck. But for the
   // most part, we'll be idling.
   private static final long CHECK_WAIT_MS = 5 * 60 * 1000;
@@ -126,7 +109,6 @@ public class FlowRunner extends EventHandler implements Runnable {
   // Sync object for queuing
   private final Object mainSyncObj = new Object();
   private final JobTypeManager jobtypeManager;
-  private final Layout loggerLayout = DEFAULT_LAYOUT;
   private final ExecutorLoader executorLoader;
   private final ProjectLoader projectLoader;
   private final int execId;
@@ -143,8 +125,7 @@ public class FlowRunner extends EventHandler implements Runnable {
   private final SwapQueue<ExecutableNode> finishedNodes;
   private final AzkabanEventReporter azkabanEventReporter;
   private final AlerterHolder alerterHolder;
-  private Logger logger;
-  private Appender flowAppender;
+  private org.slf4j.Logger logger;
   private File logFile;
   private ExecutorService executorService;
   private Thread flowRunnerThread;
@@ -187,6 +168,8 @@ public class FlowRunner extends EventHandler implements Runnable {
 
   private volatile boolean isFailedPaused = false;
 
+  private String loggerName;
+  private String logFileName;
   /**
    * Constructor. This will create its own ExecutorService for thread pools
    */
@@ -327,6 +310,19 @@ public class FlowRunner extends EventHandler implements Runnable {
     logger.info("nsWtss: " + this.flow.getNsWtss() + ", flowParamNsWtss: " + flowParamNsWtss + ", flowPropNswtss:" + flowPropNswtss);
   }
 
+/**
+   * rundate替换
+   */
+  private void runDateReplace(){
+    //获取执行Flow节点
+    ExecutableFlow ef = this.flow;
+    // FIXME New feature, replace the run_date variable in the file before the job stream starts running.
+    SystemBuiltInParamJodeTimeUtils sbipu = new SystemBuiltInParamJodeTimeUtils();
+    if(null == ef.getParentFlow()){
+      sbipu.run(this.execDir.getPath(), ef);
+    }
+  }
+  
   private void alertOnIMSRegistStart(){
     try {
       // 注册并上报作业流开始
@@ -336,7 +332,7 @@ public class FlowRunner extends EventHandler implements Runnable {
       }
       mailAlerter.alertOnIMSRegistStart(this.flow, this.sharedProps, logger);
     } catch (Exception e) {
-      logger.error("The flow report IMS faild in the end {} "+e);
+      logger.error("The flow report IMS faild in the end {} ",e);
     }
   }
 
@@ -350,7 +346,7 @@ public class FlowRunner extends EventHandler implements Runnable {
       mailAlerter.alertOnIMSRegistFinish(this.flow, this.sharedProps, this.logger);
 
     }catch (Exception e) {
-      logger.error("The flow report IMS faild in the end {} "+e);
+      logger.error("The flow report IMS faild in the end {} ",e);
     }
   }
 
@@ -359,6 +355,7 @@ public class FlowRunner extends EventHandler implements Runnable {
     try {
 	  // FIXME Create a thread pool and add a thread pool (executorServiceForCheckers) for running checker tasks.
       createThreadPool();
+	    runDateReplace();
       this.logger.info("Fetching job and shared properties.");
       if (!FlowLoaderUtils.isAzkabanFlowVersion20(this.flow.getAzkabanFlowVersion())) {
         loadAllProperties();
@@ -374,14 +371,6 @@ public class FlowRunner extends EventHandler implements Runnable {
 
       this.logger.info("Updating initial flow directory.");
       updateFlow();
-
-      //获取执行Flow节点
-      ExecutableFlow ef = this.flow;
-      // FIXME New feature, replace the run_date variable in the file before the job stream starts running.
-      SystemBuiltInParamJodeTimeUtils sbipu = new SystemBuiltInParamJodeTimeUtils();
-      if(null == ef.getParentFlow()){
-        sbipu.run(this.execDir.getPath(), ef);
-      }
 
       this.fireEventListeners(
               Event.create(this, EventType.FLOW_STARTED, new EventData(this.getExecutableFlow())));
@@ -533,29 +522,16 @@ public class FlowRunner extends EventHandler implements Runnable {
    * setup logger and execution dir for the flowId
    */
   private void createLogger(final String flowId) {
-    // Create logger
-    final String loggerName = this.execId + "." + flowId;
-    this.logger = Logger.getLogger(loggerName);
-
-    // Create file appender
-    final String logName = "_flow." + loggerName + ".log";
-    this.logFile = new File(this.execDir, logName);
-    final String absolutePath = this.logFile.getAbsolutePath();
-
-    this.flowAppender = null;
-    try {
-      this.flowAppender = new FileAppender(this.loggerLayout, absolutePath, false);
-      this.logger.addAppender(this.flowAppender);
-    } catch (final IOException e) {
-      this.logger.error("Could not open log file in " + this.execDir, e);
-    }
+    this.loggerName = UUID.randomUUID().toString() + "." + this.execId + "." + flowId;
+    this.logFileName = "_flow." + loggerName + ".log";
+    this.logFile = new File(this.execDir, logFileName);
+    LogUtils.createFlowLog(this.execDir.getAbsolutePath(), logFileName, loggerName);
+    this.logger = LoggerFactory.getLogger(loggerName);
   }
 
   public void closeLogger() {
     if (this.logger != null) {
-      this.logger.removeAppender(this.flowAppender);
-      this.flowAppender.close();
-
+      LogUtils.stopLog(loggerName);
       try {
         this.executorLoader.uploadLogFile(this.execId, "", 0, this.logFile);
       } catch (final ExecutorManagerException e) {
@@ -813,8 +789,8 @@ public class FlowRunner extends EventHandler implements Runnable {
     }
   }
 
-  public boolean setFlowFailed(final JSONObject json){
-    boolean flowFailed = json.getBooleanValue("flowFailed");
+  public boolean setFlowFailed(final JsonObject json){
+    boolean flowFailed = json.get("flowFailed").getAsBoolean();
     boolean ret = true;
     synchronized (this.mainSyncObj) {
       if (!this.flowFinished && this.flowPaused) {
@@ -1430,7 +1406,7 @@ public class FlowRunner extends EventHandler implements Runnable {
       this.activeJobRunners.add(runner);
 
     } catch (final RejectedExecutionException e) {
-      this.logger.error(e);
+      this.logger.error("", e);
     }
   }
 
@@ -2453,7 +2429,7 @@ public class FlowRunner extends EventHandler implements Runnable {
       this.activeJobRunners.add(runner);
 
     } catch (final RejectedExecutionException e) {
-      this.logger.error(e);
+      this.logger.error("", e);
     }
   }
 
